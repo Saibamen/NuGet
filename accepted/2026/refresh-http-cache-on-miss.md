@@ -46,77 +46,65 @@ The user pushed `Contoso.Foo 1.0.2` to `contoso` two minutes ago, the feed alrea
   Restored C:\src\app\app.csproj (in 4.2 sec).
 ```
 
-NuGet noticed the cached versions list for `Contoso.Foo` on `contoso` did not include `1.0.2`, refreshed that one document from the origin, found `1.0.2`, and continued. No flag, no manual cache clear. If the package is genuinely not on the feed, the second lookup confirms this and the restore fails as it does today, with no extra latency in the (overwhelming majority of) restores where the cache is up to date.
+NuGet noticed the cached versions list for `Contoso.Foo` on `contoso` did not include `1.0.2`, refreshed that one document from the origin, found `1.0.2`, and continued. No flag, no manual cache clear. If the package is genuinely not on the feed **and** the first lookup already went to origin, there is no second GET. If the first answer came from the HTTP cache, one extra origin GET confirms the miss, then restore fails with `NU1102` as today. Successful restores whose cache already contains the version do no extra HTTP.
 
-The behaviour is observable in the diagnostic-level restore log:
+The behaviour is observable at minimal log level:
 
 ```
-info :   GET https://pkgs.contoso.com/v3/registration5-gz-semver2/contoso.foo/index.json
-info :   CACHE https://pkgs.contoso.com/v3/registration5-gz-semver2/contoso.foo/index.json
-info :   Cached versions for 'Contoso.Foo' on 'contoso' did not contain 1.0.2; refreshing.
-info :   GET https://pkgs.contoso.com/v3/registration5-gz-semver2/contoso.foo/index.json
-info :   OK https://pkgs.contoso.com/v3/registration5-gz-semver2/contoso.foo/index.json 312ms
+info :   CACHE https://pkgs.contoso.com/v3/flat2/contoso.foo/index.json
+info :   Cached versions for 'Contoso.Foo' did not contain a version satisfying '[1.0.2, )'; refreshing the HTTP cache once before failing.
+info :   GET https://pkgs.contoso.com/v3/flat2/contoso.foo/index.json
+info :   OK https://pkgs.contoso.com/v3/flat2/contoso.foo/index.json 312ms
 ```
 
 #### When does refresh happen
 
 NuGet performs at most one refresh per `(package id, source)` per restore, and only when **all** of the following are true:
 
-1. The lookup is for an exact version (or for a floating range whose lower bound is higher than every version in the cached list).
-2. The cached document was served from the HTTP cache (i.e. NuGet did not already go to the origin during this restore for this URL).
-3. The required version is not present in the cached document.
-4. The user has not opted out (see "Configuration" below).
+1. The lookup is an exact, min-inclusive, non-floating version range (for example `[1.0.2, )` from a `PackageReference` Version). Floating ranges (`1.0.0-*`) are not refreshed in this change (traffic amplification).
+2. The versions document was served from the on-disk HTTP cache (`HttpSourceResultStatus.OpenedFromDisk`). A download that then writes the cache file is recorded as `OpenedFromNetwork` and is **not** refreshed again in the same restore.
+3. Every HTTP source missed on the first pass (a hit on nuget.org does not refresh a private feed that simply does not have the package).
+4. `NUGET_HTTP_CACHE_REFRESH_ON_MISS` is not `false` or `0`.
 
-When the refresh happens, NuGet reissues the request with `Cache-Control: no-cache` semantics so the response is fetched from the origin, the cache file is overwritten atomically, and the new document is used for the rest of the restore. Subsequent restores in the same time window then see a fresh document and never trigger the refresh path.
+When the refresh happens, NuGet uses `SourceCacheContext.WithRefreshCacheTrue()` (`MaxAge = now`, `RefreshMemoryCache = true`) so the origin document overwrites the cache file. Subsequent restores in the same TTL window then see a fresh document.
 
 #### Configuration
 
-The refresh-on-miss behaviour is on by default. It can be disabled in the rare case where it is undesirable (e.g. a user intentionally wants the cache to be authoritative for offline builds — see [@binki's comment on #3116](https://github.com/NuGet/Home/issues/3116#issuecomment-2855244557)) via:
+The refresh-on-miss behaviour is on by default. This change ships **one** opt-out:
 
-- `nuget.config`:
+- Environment variable: `NUGET_HTTP_CACHE_REFRESH_ON_MISS=false` (also `0`; case-insensitive `false`). Any other value, including unset, leaves the behaviour on.
 
-  ```xml
-  <configuration>
-    <config>
-      <add key="http_cache_refresh_on_miss" value="false" />
-    </config>
-  </configuration>
-  ```
-
-- Environment variable: `NUGET_HTTP_CACHE_REFRESH_ON_MISS=false`.
-- MSBuild property: `<RestoreHttpCacheRefreshOnMiss>false</RestoreHttpCacheRefreshOnMiss>`.
-
-The default is `true`. `--no-cache` continues to behave as it does today (skip the HTTP cache for all requests).
+`--no-cache` continues to skip the HTTP cache for all requests. `nuget.config` / MSBuild knobs and restore telemetry for this feature are **not** in this change (see Unresolved Questions / Future Possibilities).
 
 ### Technical explanation
 
 #### Where the change lives
 
-The relevant code lives in [NuGet/NuGet.Client](https://github.com/NuGet/NuGet.Client), in the V3 HTTP source stack:
+The relevant code lives in [NuGet/NuGet.Client](https://github.com/NuGet/NuGet.Client):
 
-- `src/NuGet.Core/NuGet.Protocol/HttpSource/HttpSource.cs`
-- `src/NuGet.Core/NuGet.Protocol/HttpSource/HttpSourceCacheContext.cs`
-- `src/NuGet.Core/NuGet.Protocol/Resources/RegistrationResourceV3.cs`
-- `src/NuGet.Core/NuGet.Protocol/Resources/RemoteV3FindPackageByIdResource.cs`
-- `src/NuGet.Core/NuGet.Protocol/Resources/HttpFileSystemBasedFindPackageByIdResource.cs`
+- `HttpSource.GetAsync` — `OpenedFromDisk` only when an **existing** cache file was read; a download that writes a new cache file is `OpenedFromNetwork`.
+- `HttpFileSystemBasedFindPackageByIdResource` and `RemoteV2FindPackageByIdResource` — record `IVersionListCacheInfo` / `VersionListFetchKind` per package id. `RemoteV3FindPackageByIdResource` does not observe `HttpSourceResult` today and stays `Unknown` (fail closed: no refresh).
+- `SourceRepositoryDependencyProvider` — one refresh per id per shared provider; skip when kind is not `HttpCache` or origin already answered this restore.
+- `ResolverUtility.FindLibraryByVersionAsync` — when **two or more** HTTP sources are present, a first pass sets `SuppressHttpCacheRefreshOnMiss` and a second pass runs only if every HTTP source missed. A single HTTP source (with or without local folders) skips that clone and second walk; refresh-on-miss stays in `SourceRepositoryDependencyProvider`.
+- `VersionListSourceMap` — records `HttpCache` vs `Network` per id without `AddOrUpdate` closures (`TryAdd` / `TryUpdate`). Network wins if both are observed.
 
-These are the components that resolve a `(package id, version)` to a content URL using a cached registration / flat-container `index.json`.
+`IVersionListCacheInfo`, `VersionListFetchKind`, and `SuppressHttpCacheRefreshOnMiss` are public because product assemblies cannot use this repo’s `InternalsVisibleTo` (those attributes are stamped with the test signing key).
 
 #### Algorithm
 
-For each `(package id, source)` lookup performed by `FindPackageByIdResource.GetAllVersionsAsync` and the registration resource:
+Lookups run through `SourceRepositoryDependencyProvider` (shared across projects in a restore) and `HttpSource.GetAsync`, which already reports `OpenedFromDisk` vs `OpenedFromNetwork`.
 
-1. Acquire the cached document via `HttpSource.GetAsync` with the existing `HttpSourceCacheContext`.
+1. Acquire the versions document via `HttpSource.GetAsync` with the existing `HttpSourceCacheContext`. Record whether it came from the HTTP cache or from origin.
 2. Parse the version list as today.
-3. If a caller (the dependency resolver) subsequently asks "does this list satisfy version `v`?" and the answer is no, mark the `(id, source)` as a candidate for refresh.
-4. Before returning `NU1102`, if any `(id, source)` was marked and refresh-on-miss is enabled and refresh has not already been attempted for that `(id, source)` in this restore, reissue the same request with `HttpSourceCacheContext` `DirectDownload = false` and `MaxAge = TimeSpan.Zero` (forces revalidation; this is what `--no-cache` already uses internally).
-5. Re-run the satisfiability check against the refreshed document. If the version is still not present, fail with `NU1102` as today (the error message is unchanged so existing diagnostics remain valid).
+3. HTTP sources are queried in parallel. If there is **more than one** HTTP source, refresh-on-miss is suppressed on this first pass. If any HTTP source (or a local source) satisfies the exact version, restore continues and no source is refreshed — a miss on a private feed does not add traffic when nuget.org (or another feed) already has the package. If there is only one HTTP source, that pass is not suppressed (no extra clone or second walk).
+4. Only if **every** HTTP source missed: for each source whose first answer was `OpenedFromDisk` (or an in-memory copy of that cached document), refresh **once** per `(id, source)` using `SourceCacheContext.WithRefreshCacheTrue()` (`MaxAge = now`, `RefreshMemoryCache = true`). Sources whose first answer was `OpenedFromNetwork` are not contacted again.
+5. Re-run the satisfiability check against the refreshed document. If the version is still not present, fail with `NU1102` as today.
 
-The refresh attempt is recorded in a per-restore `ConcurrentDictionary<(string id, string sourceUrl), byte>` so a package referenced from many projects in the same solution causes at most one refresh.
+The per-source gate lives on the shared `SourceRepositoryDependencyProvider` instance (`ConcurrentDictionary` of ids already refreshed / already fetched from origin this operation), so many projects in one restore still cause at most one refresh per `(id, source)`.
 
 #### Floating ranges
 
-The same logic applies to floating versions whose lower bound is greater than the maximum version in the cached list — exactly the heuristic [@NinoFloris suggested](https://github.com/NuGet/Home/issues/3116#issuecomment-540884810). For floating ranges that are already satisfied by the cached list, no refresh occurs (the cache may be slightly behind the feed, but that is the trade-off the cache exists to make and is unchanged from today's behaviour). This keeps the new code path scoped to "the cache cannot satisfy the request" and avoids amplifying traffic for normal restores.
+This change does **not** refresh on floating ranges (`1.0.0-*`, etc.). That matches the traffic-amplification concern from review: a floating miss is common while the graph is still walking, and a refresh-per-id there would not stay bounded to “about to fail restore”. Exact `PackageReference` versions are the #3116 report. A later follow-up can add the [@NinoFloris](https://github.com/NuGet/Home/issues/3116#issuecomment-540884810) heuristic (refresh only when the floating lower bound is above every cached version).
 
 #### Interaction with `--no-cache` and global packages folder
 
@@ -126,23 +114,17 @@ The same logic applies to floating versions whose lower bound is greater than th
 
 #### Performance
 
-The added cost in the failure-prone case is exactly one extra HTTP round-trip for the affected `(id, source)`. In the common case (cache is up to date) there is no extra HTTP traffic at all. The refresh is bounded:
+See Drawbacks (item 5) for CPU. Steady-state successful restore: **zero extra origin GETs**. Extra HTTP exists only on the path that was about to fail (or that #3116 would have failed), and only when that source’s first answer was a disk-cache hit.
 
-- At most one refresh per `(id, source)` per restore.
-- Only when the cached document was actually used (no double-fetch when the document was already fetched fresh).
-- Only when the requested version is not present — i.e. the restore was *about* to fail anyway.
-
-This is consistent with [@nkolev92's analysis](https://github.com/NuGet/Home/issues/3116#issuecomment-540879988): the perf impact is bounded by the number of distinct package ids whose cached version list does not satisfy the request, which in steady state is zero.
-
-#### Telemetry
-
-A new restore telemetry property `HttpCacheRefreshOnMissCount` is emitted per restore (count of `(id, source)` refreshes triggered). This makes the impact of the change observable on real-world feeds and gives the team a signal to tune the heuristic or scope it further if it produces unexpected traffic.
+This is consistent with [@nkolev92's analysis](https://github.com/NuGet/Home/issues/3116#issuecomment-540879988): the extra network cost is bounded by the number of distinct package ids whose **cached** version list does not satisfy the request after every HTTP source missed, which in steady state is zero.
 
 ## Drawbacks
 
-1. **Extra HTTP traffic on failing restores.** A restore that would have failed with `NU1102` now issues one additional request per missing `(id, source)` before failing. We consider this acceptable because: (a) it only happens on the failure path, (b) it's bounded to one extra request per `(id, source)` per restore, and (c) the user's alternative today is to rerun the restore with `--no-cache`, which issues *many* extra requests.
-2. **Surprises offline users who relied on cached negatives** — a small population (e.g. [@binki](https://github.com/NuGet/Home/issues/3116#issuecomment-2855244557)) intentionally relies on the cache as an authoritative "this version doesn't exist" oracle when offline. Mitigation: the new behaviour is opt-out via `nuget.config`, an environment variable, or an MSBuild property. Offline users who hit the refresh path will see a network error rather than `NU1102`, which is in fact more accurate.
-3. **One more knob.** Adding `http_cache_refresh_on_miss` increases the config surface. We mitigate this by keeping the default sensible and by re-using the existing `HttpSourceCacheContext.MaxAge = 0` plumbing rather than introducing a new HTTP code path.
+1. **Extra HTTP only on cache-backed misses after every HTTP source failed.** At most one extra origin GET per `(id, source)` before `NU1102`. If the first lookup already hit origin, extra GETs are zero. The user's alternative today is `--no-cache`, which issues *many* extra requests.
+2. **No extra HTTP on successful multi-source restores.** Refresh is deferred until every HTTP source missed.
+3. **Surprises offline users who relied on cached negatives** — a small population (e.g. [@binki](https://github.com/NuGet/Home/issues/3116#issuecomment-2855244557)) uses the cache as an authoritative "this version doesn't exist" oracle when offline. Mitigation: `NUGET_HTTP_CACHE_REFRESH_ON_MISS=false`. Offline users who hit the refresh path will see a network error rather than `NU1102`, which is more accurate.
+4. **One env var.** No nuget.config / MSBuild surface in this change. `WithRefreshCacheTrue()` reuses existing cache plumbing.
+5. **Tiny CPU only when two or more HTTP sources are used:** clone `SourceCacheContext` and suppress refresh on pass 1. A single-feed restore does not clone or walk HTTP sources twice. Recording cache vs origin does not allocate per lookup. No extra HTTP when any HTTP source hits.
 
 ## Rationale and alternatives
 
@@ -175,9 +157,9 @@ The issue has been the most-thumbsed-up open HTTP-caching issue for nearly a dec
 
 ## Unresolved Questions
 
-1. Should the refresh also fire when the cached document indicates the package id is entirely absent (i.e. the registration index 404'd and that 404 was cached), or should that case be handled by a follow-up proposal? The current proposal only addresses the "version not in list" case, which is the one reported in #3116.
-2. Should the opt-out knob be `http_cache_refresh_on_miss`, or should it be folded into a more general "HTTP cache freshness policy" config introduced in a future proposal? The minimal, targeted name is preferred unless the broader policy work is also being scheduled.
-3. Naming: should the MSBuild property be `RestoreHttpCacheRefreshOnMiss` or align with the existing `RestoreNoCache` naming convention? Resolving with the implementation review.
+1. Cached 404s for a missing package **id**: NuGet does not store 404s in the on-disk HTTP cache. In-session "not available" memory is already preceded by an HTTP call ([review on Home#14872](https://github.com/NuGet/Home/pull/14872)). This change does not add a second origin GET in that case.
+2. `nuget.config` / MSBuild opt-out and restore telemetry (`HttpCacheRefreshOnMissCount`) were in earlier drafts; this implementation ships the env-var opt-out only. Fold into a broader HTTP cache policy later if needed.
+3. Registration-based V3 (`RemoteV3FindPackageByIdResource`) does not report `VersionListFetchKind` yet (fail closed). Flat-container V3 and V2 HTTP do. Should V3 registration grow the same recording in a follow-up?
 
 ## Future Possibilities
 
@@ -185,3 +167,5 @@ The issue has been the most-thumbsed-up open HTTP-caching issue for nearly a dec
 - **Conditional GETs (`If-None-Match`).** The same plumbing can be extended so refreshes use ETags / `Last-Modified` and benefit from 304 responses, further reducing traffic.
 - **Apply to MSBuild SDK resolver.** Once the client has a stable refresh-on-miss primitive, the MSBuild SDK resolver ([#7777](https://github.com/NuGet/Home/issues/7777)) can adopt it and finally close the gap that `RestoreNoCache` does not bridge today.
 - **UI surfacing.** Visual Studio's Package Manager UI can call out when a refresh-on-miss occurred so users learn that NuGet self-corrected, building trust in the cache.
+- **nuget.config / MSBuild opt-out and restore telemetry**, if review wants a knob besides `NUGET_HTTP_CACHE_REFRESH_ON_MISS`.
+- **Floating-range refresh** when the cached max version is below the floating lower bound.
