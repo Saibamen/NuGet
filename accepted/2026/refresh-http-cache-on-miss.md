@@ -52,7 +52,7 @@ The behaviour is observable at minimal log level:
 
 ```
 info :   CACHE https://pkgs.contoso.com/v3/flat2/contoso.foo/index.json
-info :   Cached versions for 'Contoso.Foo' did not contain a version satisfying '[1.0.2, )'; refreshing the HTTP cache once before failing.
+info :   The HTTP cache for package 'Contoso.Foo' does not contain a version satisfying '[1.0.2, )'; refreshing once before failing.
 info :   GET https://pkgs.contoso.com/v3/flat2/contoso.foo/index.json
 info :   OK https://pkgs.contoso.com/v3/flat2/contoso.foo/index.json 312ms
 ```
